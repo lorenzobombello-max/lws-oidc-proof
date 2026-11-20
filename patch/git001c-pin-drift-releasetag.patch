@@ -1,0 +1,1083 @@
+diff --git a/.github/workflows/complete-website-project-preview-runner.yml b/.github/workflows/complete-website-project-preview-runner.yml
+new file mode 100644
+index 0000000..fdd7391
+--- /dev/null
++++ b/.github/workflows/complete-website-project-preview-runner.yml
+@@ -0,0 +1,54 @@
++name: Complete Website Project Preview Runner
++# GIT-001C pin-drift fix: reviewed monitor logic, called ONLY by the thin
++# workflow_run caller at a protected release tag (lws-preview-runner-YYYYMMDD-NN).
++# The completion endpoint accepts its OIDC token only when job_workflow_ref is
++# this file at the configured tag and job_workflow_sha equals the reviewed pin.
++# No customer artifacts are downloaded or executed here.
++on:
++  workflow_call:
++    inputs:
++      platform_ref:
++        description: "Reviewed release tag name; must equal the tag this runner is called at"
++        required: true
++        type: string
++      completion_endpoint:
++        required: true
++        type: string
++      completion_oidc_audience:
++        required: true
++        type: string
++permissions:
++  contents: read
++  id-token: write
++jobs:
++  complete:
++    runs-on: ubuntu-latest
++    timeout-minutes: 3
++    permissions:
++      contents: read
++      id-token: write
++    steps:
++      - name: Require a reviewed release tag name
++        shell: bash
++        env:
++          PLATFORM_REF: ${{ inputs.platform_ref }}
++        run: |
++          if [[ ! "$PLATFORM_REF" =~ ^lws-preview-runner-[0-9]{8}-[0-9]{2}$ ]]; then
++            echo "HARD STOP - platform_ref is not a reviewed release tag" >&2
++            exit 1
++          fi
++      - uses: actions/checkout@v4
++        with:
++          ref: refs/tags/${{ inputs.platform_ref }}
++          persist-credentials: false
++      - name: Record checked-out platform revision
++        shell: bash
++        run: echo "LWS_PLATFORM_HEAD=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
++      - uses: denoland/setup-deno@v2
++        with:
++          deno-version: "2.9.5"
++      - name: Confirm provider outcome and finalize the existing lease
++        run: deno run --allow-env --allow-read --allow-net scripts/website-project-preview-complete.ts
++        env:
++          LWS_PREVIEW_COMPLETION_ENDPOINT: ${{ inputs.completion_endpoint }}
++          LWS_PREVIEW_COMPLETION_OIDC_AUDIENCE: ${{ inputs.completion_oidc_audience }}
+diff --git a/.github/workflows/complete-website-project-preview.yml b/.github/workflows/complete-website-project-preview.yml
+index d2277ed..0158384 100644
+--- a/.github/workflows/complete-website-project-preview.yml
++++ b/.github/workflows/complete-website-project-preview.yml
+@@ -1,4 +1,13 @@
+ name: Complete Website Project Preview
++# GIT-001C pin-drift fix: thin caller only.
++# workflow_run always executes this file from the default branch, so its own
++# revision follows main. It therefore contains no logic: the reviewed monitor
++# runs in the reusable runner at the protected release tag below, and the
++# completion endpoint pins that runner through the OIDC job_workflow_ref and
++# job_workflow_sha claims. Main may move freely without breaking completion.
++# Release rule: the tag in `uses:` and in `platform_ref` must be the SAME
++# reviewed tag as LWS_PREVIEW_WORKFLOW_REF_NAME (see
++# docs/website-project-preview-release-tag.md).
+ on:
+   workflow_run:
+     workflows: ["Build Website Project Preview (async, multi-file)"]
+@@ -9,18 +18,11 @@ permissions:
+ jobs:
+   complete:
+     if: github.event.workflow_run.event == 'workflow_dispatch' && github.event.workflow_run.run_attempt == 1
+-    runs-on: ubuntu-latest
+-    timeout-minutes: 3
+-    steps:
+-      - uses: actions/checkout@v4
+-        with:
+-          ref: ${{ github.sha }}
+-          persist-credentials: false
+-      - uses: denoland/setup-deno@v2
+-        with:
+-          deno-version: "2.9.5"
+-      - name: Confirm provider outcome and finalize the existing lease
+-        run: deno run --allow-env --allow-read --allow-net scripts/website-project-preview-complete.ts
+-        env:
+-          LWS_PREVIEW_COMPLETION_ENDPOINT: ${{ vars.LWS_PREVIEW_COMPLETION_ENDPOINT }}
+-          LWS_PREVIEW_COMPLETION_OIDC_AUDIENCE: ${{ vars.LWS_PREVIEW_COMPLETION_OIDC_AUDIENCE }}
++    permissions:
++      contents: read
++      id-token: write
++    uses: lorenzobombello-max/lorenzo-web-studio/.github/workflows/complete-website-project-preview-runner.yml@lws-preview-runner-20261121-01
++    with:
++      platform_ref: lws-preview-runner-20261121-01
++      completion_endpoint: ${{ vars.LWS_PREVIEW_COMPLETION_ENDPOINT }}
++      completion_oidc_audience: ${{ vars.LWS_PREVIEW_COMPLETION_OIDC_AUDIENCE }}
+diff --git a/docs/website-project-preview-dispatch.md b/docs/website-project-preview-dispatch.md
+index 7f662b6..b33736d 100644
+--- a/docs/website-project-preview-dispatch.md
++++ b/docs/website-project-preview-dispatch.md
+@@ -180,13 +180,23 @@ cleanup. There is no terminal transition back to RUNNING or PASS.
+    unexpected permission levels. The customer repository App is not a substitute.
+    Dispatch tokens request Actions write; completion tokens request Actions read.
+    Existing PDF dispatch behavior and customer source-token scopes are unchanged.
+-5. Set `LWS_PREVIEW_WORKFLOW_SHA` to a reviewed platform commit and separately
+-   approve that same SHA in the protected database allowlist. Dispatch targets
+-   `main`; movement of main causes OIDC revision rejection rather than building
+-   under an unreviewed workflow. Keep deployment pins synchronized intentionally.
++5. Pin the workflows to a protected release tag, not to `main`. Follow
++   [the release-tag procedure](website-project-preview-release-tag.md): create
++   the lightweight tag `lws-preview-runner-YYYYMMDD-NN` on the reviewed commit,
++   protect it with a tag ruleset, set `LWS_PREVIEW_WORKFLOW_REF_NAME`,
++   `LWS_PREVIEW_WORKFLOW_REF` and `LWS_PREVIEW_WORKFLOW_SHA` to that tag/commit
++   and approve the same SHA in the protected database allowlist. Dispatch then
++   targets the tag, so later commits on main no longer cause OIDC revision
++   rejection. Before each dispatch the commit behind the configured ref is read
++   and compared with the pin; drift ends the attempt as
++   `PROJECT_PREVIEW_WORKFLOW_PIN_DRIFT` without starting a run.
++   `refs/heads/main` remains accepted only as the legacy configuration.
+ 6. Preserve existing source/artifact OIDC and Storage settings. Configure the
+    completion endpoint plus `LWS_PREVIEW_COMPLETION_OIDC_AUDIENCE` and the
+-   separately reviewed `LWS_PREVIEW_COMPLETION_WORKFLOW_SHA`. Deploy the completion
++   separately reviewed `LWS_PREVIEW_COMPLETION_WORKFLOW_SHA` (the commit of the
++   same release tag: the thin `workflow_run` caller on main calls the reusable
++   runner at that tag, and the endpoint pins the runner's OIDC
++   `job_workflow_ref`/`job_workflow_sha`). Deploy the completion
+    function with gateway JWT verification disabled only because its handler
+    verifies GitHub OIDC itself, like the existing source/artifact endpoints.
+ 7. Approve and activate a bounded trusted schedule for the deadline entrypoint;
+diff --git a/docs/website-project-preview-release-tag.md b/docs/website-project-preview-release-tag.md
+new file mode 100644
+index 0000000..74bd25a
+--- /dev/null
++++ b/docs/website-project-preview-release-tag.md
+@@ -0,0 +1,124 @@
++# Website project preview: release-tag pinning (GIT-001C pin-drift fix)
++
++Status: candidate procedure. Nothing here has been executed.
++
++## Problem this solves
++
++Before this change the build workflow was dispatched on `main`, while the
++source-token, artifact and completion endpoints require one exact, reviewed
++workflow commit (`LWS_PREVIEW_WORKFLOW_SHA`, `LWS_PREVIEW_COMPLETION_WORKFLOW_SHA`
++and the database allowlist). Every later commit on `main`, including
++documentation, made GitHub run a different commit than the pin. The OIDC broker
++then correctly refused with `OIDC_WORKFLOW_REVISION_MISMATCH`, which the
++source-token handler masked as `503 SOURCE_TOKEN_EXCHANGE_FAILED`.
++The `workflow_run` completion monitor always runs from the default branch and
++drifted the same way.
++
++## Design
++
++- **Build**: dispatched on a protected, lightweight tag
++  `lws-preview-runner-YYYYMMDD-NN`. GitHub then sets `ref`, `workflow_ref`,
++  `sha` and `workflow_sha` from the tag, so the run commit stays equal to the pin
++  while `main` moves.
++- **Completion**: `complete-website-project-preview.yml` on `main` is a thin
++  caller with no logic. It calls
++  `complete-website-project-preview-runner.yml` at the same tag. The completion
++  endpoint checks the caller's identity (repository, `refs/heads/main`,
++  `workflow_run`, run id, attempt 1) and pins the runner through the OIDC
++  claims `job_workflow_ref` and `job_workflow_sha`.
++- **Pre-dispatch guard**: before the dispatch POST the commit behind the
++  configured ref is read. A difference ends the attempt as
++  `PROJECT_PREVIEW_WORKFLOW_PIN_DRIFT`; an unreadable ref as
++  `PROJECT_PREVIEW_WORKFLOW_PIN_UNVERIFIABLE`. Both record `REJECTED`, so the
++  lease is released instead of left `ACCEPTED`.
++- **Diagnostics**: OIDC revision, attempt, event and job-workflow refusals are
++  returned as their own codes instead of a generic 503.
++- `refs/heads/main` stays accepted as legacy configuration, which allows a
++  configuration-only rollback.
++
++## Configuration per release (no secret values)
++
++With `T` = tag name and `M` = the reviewed 40-hex commit the tag points to:
++
++| Function | Variable | Value |
++|---|---|---|
++| commercial-operator-command | `LWS_PREVIEW_WORKFLOW_REF_NAME` | `refs/tags/T` |
++| commercial-operator-command | `LWS_PREVIEW_WORKFLOW_SHA` | `M` |
++| website-project-preview-source-token, website-project-preview-artifact | `LWS_PREVIEW_WORKFLOW_REF_NAME` | `refs/tags/T` |
++| website-project-preview-source-token, website-project-preview-artifact | `LWS_PREVIEW_WORKFLOW_REF` | `lorenzobombello-max/lorenzo-web-studio/.github/workflows/build-website-project-preview.yml@refs/tags/T` |
++| website-project-preview-completion | `LWS_PREVIEW_WORKFLOW_REF_NAME` | `refs/tags/T` |
++| website-project-preview-completion | `LWS_PREVIEW_COMPLETION_WORKFLOW_SHA` | `M` |
++| database | `lws_internal.website_project_preview_workflow_revisions` | `M` enabled |
++
++The caller file on `main` must name `T` in both `uses: ...@T` and
++`platform_ref: T` (enforced by `scripts/website-project-preview-workflow.test.mjs`).
++
++## Release order (each step needs separate owner approval)
++
++1. Stop new preview requests; let in-flight runs finish. Handle stale leases only
++   via their own approved procedure (for dossier 007: WP-A terminalisation).
++2. Merge the reviewed candidate to `main` as commit `M`. Its caller file already
++   names `T`. Until step 3 the caller cannot resolve the runner, so no build may
++   run in between.
++3. Create the lightweight tag `T` on `M` (not annotated: the guard requires
++   `object.type == "commit"`).
++4. Add a tag ruleset for `refs/tags/lws-preview-runner-*`: block update
++   (force-move) and deletion, and restrict creation to the owner.
++5. Set the variables above, add `M` to the allowlist, deploy the four functions,
++   then read the configuration back for equality without publishing secrets.
++6. Run exactly one approved acceptance build: dispatch on `T`, one run claim,
++   source token, build, upload, finalisation and completion.
++7. Only after a PASS, disable the old allowlist rows that are no longer used.
++
++A later release repeats this with a new tag (`...-NN+1`). Commits on `main`
++between releases no longer affect running previews.
++
++## Facts to prove on staging before production
++
++- Run-API `head_branch` for a run dispatched on a tag equals the tag name.
++- The `job_workflow_ref` of a reusable workflow called at a tag has the form
++  `owner/repo/.github/workflows/<file>@refs/tags/<tag>`, and `job_workflow_sha`
++  equals the tag commit.
++- The dispatch installation token (Actions write, Metadata read) can read
++  `GET /repos/{repo}/git/ref/tags/T` on this public repository. If the
++  repository becomes private, this needs a separate permission decision. Do not
++  silently broaden the App.
++
++If any of these does not hold, the code fails closed with an explicit code. It
++never builds with a different revision.
++
++## Recovery after `PROJECT_PREVIEW_DISPATCH_REJECT_UNRECORDED`
++
++Nothing was dispatched, but the refusal was not confirmed as recorded. The
++lease may therefore still be open. Never retry blindly.
++
++1. Read-only: check the row in `lws_internal.website_project_preview_dispatches`
++   for that `preview_lease_id` (`state`, `finished_at`, `expires_at`,
++   `workflow_run_id`). If `finished_at` is set, nothing needs doing.
++2. If it is still open, wait until `expires_at` has passed. Never edit a state
++   by hand.
++3. Read-only: list ALL unfinished expired leases
++   (`finished_at is null and expires_at <= now()`). The routine in step 4
++   processes all of them (up to 100), so the list must contain exactly the
++   expected lease(s); otherwise STOP.
++4. Only with separate owner approval: as `service_role`, run
++   `select public.expire_website_project_preview_dispatches_v1();` exactly once.
++   This existing all-dossier routine moves expired leases to FAILED with reason
++   `DEADLINE_EXCEEDED`. The scheduled cleanup covers only dossier 006 since
++   `20261108000300`.
++5. Read the row again and register the result.
++
++The stale dossier-007 lease from WP-A follows the same route.
++
++## Rollback
++
++Switching the configuration back to `refs/heads/main` is **not** a recovery. It
++only works if main at that moment equals an approved, allowlisted SHA exactly;
++otherwise the original pin-drift failure returns.
++
++- First choice: close new preview requests. Let in-flight runs finish or expire,
++  and handle them with the recovery route above.
++- Code: apply the reverse patch from the candidate package. The tag may stay;
++  it changes nothing without configuration.
++- Use the legacy main configuration only when `git rev-parse origin/main` equals
++  an allowlisted SHA exactly. Freeze main for as long as that state is needed.
+diff --git a/scripts/website-project-preview-complete.ts b/scripts/website-project-preview-complete.ts
+index 2cae2e1..d666d1e 100644
+--- a/scripts/website-project-preview-complete.ts
++++ b/scripts/website-project-preview-complete.ts
+@@ -4,6 +4,20 @@ function required(name: string): string {
+   return value;
+ }
+ 
++export function assertRunnerRevision(oidcToken: string, checkedOutHead: string): void {
++  const payload = oidcToken.split(".")[1] ?? "";
++  let claims: Record<string, unknown>;
++  try {
++    const padded = payload.replaceAll("-", "+").replaceAll("_", "/").padEnd(Math.ceil(payload.length / 4) * 4, "=");
++    claims = JSON.parse(atob(padded));
++  } catch {
++    throw new Error("COMPLETION_OIDC_UNAVAILABLE");
++  }
++  if (!/^[0-9a-f]{40}$/.test(checkedOutHead) || claims?.job_workflow_sha !== checkedOutHead) {
++    throw new Error("COMPLETION_RUNNER_REVISION_MISMATCH");
++  }
++}
++
+ export async function completePreviewWorkflow() {
+   const event = JSON.parse(await Deno.readTextFile(required("GITHUB_EVENT_PATH")));
+   const run = event.workflow_run;
+@@ -18,6 +32,9 @@ export async function completePreviewWorkflow() {
+   if (!oidcResponse.ok) throw new Error("COMPLETION_OIDC_UNAVAILABLE");
+   const oidc = await oidcResponse.json();
+   if (typeof oidc.value !== "string" || !oidc.value) throw new Error("COMPLETION_OIDC_UNAVAILABLE");
++  // Client-side consistency only (the endpoint enforces the real pin): the code
++  // checked out here must be the same revision GitHub attests for this runner.
++  assertRunnerRevision(oidc.value, required("LWS_PLATFORM_HEAD"));
+   const response = await fetch(required("LWS_PREVIEW_COMPLETION_ENDPOINT"), {
+     method: "POST", redirect: "error", signal: AbortSignal.timeout(60000),
+     headers: { authorization: `Bearer ${oidc.value}`, "content-type": "application/json" },
+diff --git a/scripts/website-project-preview-workflow.test.mjs b/scripts/website-project-preview-workflow.test.mjs
+index c11acbd..a12cab7 100644
+--- a/scripts/website-project-preview-workflow.test.mjs
++++ b/scripts/website-project-preview-workflow.test.mjs
+@@ -68,9 +68,37 @@ test("workflow has durable correlation, bounded jobs, LF directory mount and no
+ 
+ test("completion monitor handles completed workflows without executing customer artifacts", async () => {
+   const monitor = await readFile(new URL("../.github/workflows/complete-website-project-preview.yml", import.meta.url), "utf8");
++  const runner = await readFile(new URL("../.github/workflows/complete-website-project-preview-runner.yml", import.meta.url), "utf8");
+   assert.match(monitor, /workflow_run:/);
+   assert.match(monitor, /types: \[completed\]/);
+   assert.match(monitor, /id-token: write/);
+-  assert.match(monitor, /website-project-preview-complete\.ts/);
+-  assert.doesNotMatch(monitor, /download-artifact|npm ci|npm run|contents: write/);
++  assert.match(runner, /website-project-preview-complete\.ts/);
++  for (const file of [monitor, runner]) {
++    assert.doesNotMatch(file, /download-artifact|npm ci|npm run|contents: write|secrets: inherit/);
++  }
++});
++
++test("thin monitor caller pins the reusable runner to one reviewed release tag", async () => {
++  const monitor = await readFile(new URL("../.github/workflows/complete-website-project-preview.yml", import.meta.url), "utf8");
++  const runner = await readFile(new URL("../.github/workflows/complete-website-project-preview-runner.yml", import.meta.url), "utf8");
++  const uses = monitor.match(/^\s*uses: lorenzobombello-max\/lorenzo-web-studio\/\.github\/workflows\/complete-website-project-preview-runner\.yml@(\S+)\s*$/m);
++  const platformRef = monitor.match(/^\s*platform_ref: (\S+)\s*$/m);
++  assert.ok(uses, "caller must call the runner by full repository path");
++  assert.ok(platformRef, "caller must pass platform_ref");
++  assert.match(uses[1], /^lws-preview-runner-[0-9]{8}-[0-9]{2}$/);
++  assert.equal(platformRef[1], uses[1], "uses-tag and platform_ref must be the same reviewed tag");
++  // no logic in the caller: no steps, no checkout, no script
++  assert.doesNotMatch(monitor, /steps:|actions\/checkout|deno run|\.\/\.github/);
++  assert.match(runner, /workflow_call:/);
++  assert.doesNotMatch(runner, /workflow_run:|workflow_dispatch:|push:/);
++  assert.match(runner, /ref: refs\/tags\/\$\{\{ inputs\.platform_ref \}\}/);
++  assert.match(runner, /\^lws-preview-runner-\[0-9\]\{8\}-\[0-9\]\{2\}\$/);
++  assert.match(runner, /LWS_PLATFORM_HEAD=\$\(git rev-parse HEAD\)/);
++  assert.match(runner, /persist-credentials: false/);
++  // untrusted inputs reach shell steps only through env, never by direct interpolation in run:
++  for (const block of runner.split(/\n\s*- /).filter((b) => /\brun:/.test(b))) {
++    const runBody = block.slice(block.indexOf("run:"));
++    const beforeEnv = runBody.split(/\n\s*env:/)[0];
++    assert.doesNotMatch(beforeEnv, /\$\{\{\s*inputs\./, "inputs must not be interpolated into run:");
++  }
+ });
+diff --git a/supabase/functions/_shared/website-project-preview-dispatch-runtime.ts b/supabase/functions/_shared/website-project-preview-dispatch-runtime.ts
+index 4105ecd..ed7353e 100644
+--- a/supabase/functions/_shared/website-project-preview-dispatch-runtime.ts
++++ b/supabase/functions/_shared/website-project-preview-dispatch-runtime.ts
+@@ -2,7 +2,11 @@ import { loadWebsiteProjectPreviewDispatchAppConfig } from "./github-app-config.
+ import { createGitHubAppTokenBroker } from "./github-app-token.ts";
+ import { createGitHubHttpClient } from "./github-http.ts";
+ import { initializeGitHubAppInputSigner } from "../github-app-gate6-probe/runtime.ts";
+-import { createWebsiteProjectPreviewDispatch, type PreviewDispatchRpc } from "./website-project-preview-dispatch.ts";
++import {
++  createWebsiteProjectPreviewDispatch,
++  PREVIEW_WORKFLOW_REPOSITORY,
++  type PreviewDispatchRpc,
++} from "./website-project-preview-dispatch.ts";
+ 
+ export function createPreviewPlatformTokenProvider(
+   operation: "WEBSITE_PROJECT_PREVIEW_DISPATCH" | "WEBSITE_PROJECT_PREVIEW_MONITOR" = "WEBSITE_PROJECT_PREVIEW_DISPATCH",
+@@ -28,11 +32,43 @@ export function createPreviewPlatformTokenProvider(
+   };
+ }
+ 
++/**
++ * Reads the commit a single platform ref points to. Fail-closed: only an exact,
++ * lightweight ref (object.type "commit") is accepted; annotated tags, redirects,
++ * non-200 responses or malformed bodies all throw.
++ */
++export function createPreviewRefCommitReader(runtimeFetch: (request: Request) => Promise<Response>) {
++  return async (refName: string, token: string): Promise<string> => {
++    const path = refName.replace(/^refs\//, "");
++    const response = await runtimeFetch(new Request(
++      `https://api.github.com/repos/${PREVIEW_WORKFLOW_REPOSITORY}/git/ref/${path}`,
++      {
++        method: "GET", redirect: "error", signal: AbortSignal.timeout(10000),
++        headers: { authorization: `Bearer ${token}`, accept: "application/vnd.github+json",
++          "x-github-api-version": "2022-11-28" },
++      },
++    ));
++    if (response.status !== 200) {
++      await response.body?.cancel();
++      throw new Error("PROJECT_PREVIEW_WORKFLOW_PIN_UNVERIFIABLE");
++    }
++    const body = await response.json() as { ref?: unknown; object?: { type?: unknown; sha?: unknown } };
++    if (body?.ref !== refName || body.object?.type !== "commit"
++      || typeof body.object.sha !== "string" || !/^[0-9a-f]{40}$/.test(body.object.sha)) {
++      throw new Error("PROJECT_PREVIEW_WORKFLOW_PIN_UNVERIFIABLE");
++    }
++    return body.object.sha;
++  };
++}
++
+ export function createWebsiteProjectPreviewRuntimeDispatch(client: PreviewDispatchRpc) {
++  const runtimeFetch = (request: Request) => fetch(request);
+   return createWebsiteProjectPreviewDispatch({
+     client,
+     workflowSha: Deno.env.get("LWS_PREVIEW_WORKFLOW_SHA") ?? "",
++    workflowRefName: Deno.env.get("LWS_PREVIEW_WORKFLOW_REF_NAME") ?? "",
+     acquireToken: createPreviewPlatformTokenProvider(),
+-    fetch: (request) => fetch(request),
++    readRefCommit: createPreviewRefCommitReader(runtimeFetch),
++    fetch: runtimeFetch,
+   });
+ }
+diff --git a/supabase/functions/_shared/website-project-preview-dispatch.test.ts b/supabase/functions/_shared/website-project-preview-dispatch.test.ts
+index 4f538f3..2e6fd78 100644
+--- a/supabase/functions/_shared/website-project-preview-dispatch.test.ts
++++ b/supabase/functions/_shared/website-project-preview-dispatch.test.ts
+@@ -1,5 +1,10 @@
+ import assert from "node:assert/strict";
+-import { assertPreviewWorkflowConfiguration, createWebsiteProjectPreviewDispatch } from "./website-project-preview-dispatch.ts";
++import {
++  assertPreviewWorkflowConfiguration,
++  assertPreviewWorkflowRefName,
++  createWebsiteProjectPreviewDispatch,
++  previewWorkflowRefShortName,
++} from "./website-project-preview-dispatch.ts";
+ 
+ const lease = "11111111-1111-4111-8111-111111111111";
+ const build = "22222222-2222-4222-8222-222222222222";
+@@ -13,12 +18,41 @@ Deno.test("source and artifact OIDC configuration cannot select a fork or anothe
+   assert.throws(() => assertPreviewWorkflowConfiguration(repository, "123", ref, "refs/heads/main"));
+   assert.throws(() => assertPreviewWorkflowConfiguration(repository, "1320223175", ref, "refs/heads/other"));
+ });
+-function fixture(status = 204, ambiguous = false) {
++Deno.test("release-tag configuration is accepted only for the exact build workflow at a reviewed tag", () => {
++  const repository = "lorenzobombello-max/lorenzo-web-studio";
++  const tag = "refs/tags/lws-preview-runner-20261121-01";
++  const ref = `${repository}/.github/workflows/build-website-project-preview.yml@${tag}`;
++  assertPreviewWorkflowConfiguration(repository, "1320223175", ref, tag);
++  assert.equal(previewWorkflowRefShortName(tag), "lws-preview-runner-20261121-01");
++  assert.equal(previewWorkflowRefShortName("refs/heads/main"), "main");
++  // workflowRef and refName must name the same ref
++  assert.throws(() => assertPreviewWorkflowConfiguration(repository, "1320223175", ref, "refs/heads/main"));
++  assert.throws(() => assertPreviewWorkflowConfiguration(repository, "1320223175",
++    `${repository}/.github/workflows/build-website-project-preview.yml@refs/heads/main`, tag));
++  for (const bad of ["refs/tags/v1", "refs/tags/lws-preview-runner-2026112-01", "refs/tags/lws-preview-runner-20261121-01x",
++    "refs/heads/lws-preview-runner-20261121-01", "lws-preview-runner-20261121-01", "refs/tags/lws-preview-runner-20261121-01/../main"]) {
++    assert.throws(() => assertPreviewWorkflowRefName(bad), /CONFIGURATION_INVALID/, bad);
++  }
++});
++function fixture(status = 204, ambiguous = false, options: Readonly<{
++  refName?: string; refCommit?: string | Error;
++  /** Behaviour of the REJECTED write: normal FAILED, a DB error, a thrown transport error, or an unexpected state. */
++  rejectWrite?: "ok" | "db-error" | "throws" | "not-failed";
++}> = {}) {
+   let claimed = false;
+   const calls: string[] = [];
+   const requests: Request[] = [];
++  const refReads: Array<[string, string]> = [];
++  const outcomes: unknown[] = [];
+   const service = createWebsiteProjectPreviewDispatch({
+     workflowSha,
++    workflowRefName: options.refName ?? "refs/heads/main",
++    readRefCommit: async (refName, token) => {
++      refReads.push([refName, token]);
++      const value = options.refCommit ?? workflowSha;
++      if (value instanceof Error) throw value;
++      return value;
++    },
+     client: { rpc(name, args) {
+       calls.push(name);
+       if (name.startsWith("claim_")) {
+@@ -28,6 +62,16 @@ function fixture(status = 204, ambiguous = false) {
+           commitSha: sha, workflowSha, repositoryOwner: "acme", repositoryName: "website",
+           repositoryId: "123", dispatchAllowed, state: "ATTEMPTED" } });
+       }
++      outcomes.push(args.p_outcome);
++      if (args.p_outcome === "REJECTED" && options.rejectWrite === "db-error") {
++        return Promise.resolve({ error: { message: "private db detail" }, data: null });
++      }
++      if (args.p_outcome === "REJECTED" && options.rejectWrite === "throws") {
++        return Promise.reject(new TypeError("private network detail"));
++      }
++      if (args.p_outcome === "REJECTED" && options.rejectWrite === "not-failed") {
++        return Promise.resolve({ error: null, data: { state: "ATTEMPTED" } });
++      }
+       return Promise.resolve({ error: null, data: {
+         state: args.p_outcome === "REJECTED" ? "FAILED" : args.p_outcome,
+       } });
+@@ -39,7 +83,7 @@ function fixture(status = 204, ambiguous = false) {
+       return new Response(null, { status });
+     },
+   });
+-  return { service, calls, requests };
++  return { service, calls, requests, refReads, outcomes };
+ }
+ Deno.test("one durable claim permits one dispatch across duplicate calls", async () => {
+   const f = fixture();
+@@ -81,3 +125,54 @@ Deno.test("mismatched pinned commit never reaches GitHub", async () => {
+   await assert.rejects(() => f.service.dispatch(lease, build, "c".repeat(40)), /AUTHORITY_INVALID/);
+   assert.equal(f.requests.length, 0);
+ });
++
++Deno.test("legacy configuration still dispatches on main after a matching guard read", async () => {
++  const f = fixture();
++  assert.equal((await f.service.dispatch(lease, build, sha)).status, "BUILD_QUEUED");
++  assert.deepEqual(f.refReads, [["refs/heads/main", "test-token"]]);
++  assert.equal((await f.requests[0].json()).ref, "main");
++});
++Deno.test("release-tag configuration dispatches on the reviewed tag, never on main", async () => {
++  const f = fixture(204, false, { refName: "refs/tags/lws-preview-runner-20261121-01" });
++  assert.equal((await f.service.dispatch(lease, build, sha)).status, "BUILD_QUEUED");
++  assert.deepEqual(f.refReads, [["refs/tags/lws-preview-runner-20261121-01", "test-token"]]);
++  assert.equal((await f.requests[0].json()).ref, "lws-preview-runner-20261121-01");
++});
++Deno.test("pin drift is refused before GitHub runs anything and the attempt ends REJECTED", async () => {
++  const f = fixture(204, false, { refCommit: "d".repeat(40) });
++  await assert.rejects(() => f.service.dispatch(lease, build, sha), /^Error: PROJECT_PREVIEW_WORKFLOW_PIN_DRIFT$/);
++  assert.equal(f.requests.length, 0);
++  assert.deepEqual(f.outcomes, ["REJECTED"]);
++  assert.equal(f.calls.at(-1), "record_website_project_preview_dispatch_v1");
++});
++Deno.test("an unreadable ref fails closed without dispatch and without leaking detail", async () => {
++  const f = fixture(204, false, { refCommit: new Error("private provider detail") });
++  const error = await f.service.dispatch(lease, build, sha).then(() => null, (e) => e as Error);
++  assert.equal(error?.message, "PROJECT_PREVIEW_WORKFLOW_PIN_UNVERIFIABLE");
++  assert.equal(f.requests.length, 0);
++  assert.deepEqual(f.outcomes, ["REJECTED"]);
++});
++Deno.test("missing or invalid ref configuration never constructs a dispatcher", () => {
++  for (const refName of ["", "main", "refs/heads/dev", "refs/tags/latest"]) {
++    assert.throws(() => createWebsiteProjectPreviewDispatch({
++      workflowSha, workflowRefName: refName,
++      client: { rpc: () => Promise.resolve({ data: null, error: null }) },
++      acquireToken: async () => ({ token: "t", expiresAt: new Date(Date.now() + 60000).toISOString() }),
++      readRefCommit: async () => workflowSha,
++      fetch: async () => new Response(null, { status: 204 }),
++    }), /PROJECT_PREVIEW_WORKFLOW_NOT_CONFIGURED/, refName);
++  }
++});
++
++Deno.test("a failed, broken or unconfirmed REJECTED write is reported as REJECT_UNRECORDED, never as a normal refusal", async () => {
++  for (const rejectWrite of ["db-error", "throws", "not-failed"] as const) {
++    for (const refCommit of ["d".repeat(40), new Error("unreadable")]) {
++      const f = fixture(204, false, { refCommit, rejectWrite });
++      const error = await f.service.dispatch(lease, build, sha).then(() => null, (e) => e as Error);
++      assert.equal(error?.message, "PROJECT_PREVIEW_DISPATCH_REJECT_UNRECORDED", `${rejectWrite}`);
++      // nothing was dispatched and exactly one REJECTED attempt was made (no blind retry)
++      assert.equal(f.requests.length, 0);
++      assert.deepEqual(f.outcomes, ["REJECTED"]);
++    }
++  }
++});
+diff --git a/supabase/functions/_shared/website-project-preview-dispatch.ts b/supabase/functions/_shared/website-project-preview-dispatch.ts
+index 8e86d8d..ed649d2 100644
+--- a/supabase/functions/_shared/website-project-preview-dispatch.ts
++++ b/supabase/functions/_shared/website-project-preview-dispatch.ts
+@@ -5,11 +5,33 @@ export const PREVIEW_WORKFLOW_REPOSITORY = "lorenzobombello-max/lorenzo-web-stud
+ export const PREVIEW_WORKFLOW_REPOSITORY_ID = "1320223175";
+ export const PREVIEW_WORKFLOW_PATH = ".github/workflows/build-website-project-preview.yml";
+ export const PREVIEW_MONITOR_PATH = ".github/workflows/complete-website-project-preview.yml";
++// GIT-001C pin-drift fix: the monitor logic lives in a reusable workflow that the
++// thin workflow_run caller on main invokes at the reviewed release tag. Its OIDC
++// job_workflow_ref/job_workflow_sha stay pinned while main keeps moving.
++export const PREVIEW_MONITOR_RUNNER_PATH = ".github/workflows/complete-website-project-preview-runner.yml";
++export const PREVIEW_LEGACY_REF_NAME = "refs/heads/main";
++// Reviewed, ruleset-protected release tags only: lws-preview-runner-YYYYMMDD-NN.
++const PREVIEW_RELEASE_TAG_REF = /^refs\/tags\/lws-preview-runner-[0-9]{8}-[0-9]{2}$/;
++
++export function assertPreviewWorkflowRefName(refName: string): string {
++  if (refName !== PREVIEW_LEGACY_REF_NAME && !PREVIEW_RELEASE_TAG_REF.test(refName)) {
++    throw new Error("PROJECT_PREVIEW_WORKFLOW_CONFIGURATION_INVALID");
++  }
++  return refName;
++}
++
++/** Short ref as used by the dispatch API and by GitHub run.head_branch ("main" or the tag name). */
++export function previewWorkflowRefShortName(refName: string): string {
++  assertPreviewWorkflowRefName(refName);
++  return refName.replace(/^refs\/(heads|tags)\//, "");
++}
+ 
+ export function assertPreviewWorkflowConfiguration(repository: string, repositoryId: string, workflowRef: string, refName: string) {
+-  if (repository !== PREVIEW_WORKFLOW_REPOSITORY || repositoryId !== PREVIEW_WORKFLOW_REPOSITORY_ID
+-    || workflowRef !== `${PREVIEW_WORKFLOW_REPOSITORY}/${PREVIEW_WORKFLOW_PATH}@refs/heads/main`
+-    || refName !== "refs/heads/main") {
++  if (repository !== PREVIEW_WORKFLOW_REPOSITORY || repositoryId !== PREVIEW_WORKFLOW_REPOSITORY_ID) {
++    throw new Error("PROJECT_PREVIEW_WORKFLOW_CONFIGURATION_INVALID");
++  }
++  assertPreviewWorkflowRefName(refName);
++  if (workflowRef !== `${PREVIEW_WORKFLOW_REPOSITORY}/${PREVIEW_WORKFLOW_PATH}@${refName}`) {
+     throw new Error("PROJECT_PREVIEW_WORKFLOW_CONFIGURATION_INVALID");
+   }
+ }
+@@ -45,11 +67,21 @@ export function previewDispatchStatus(state: unknown): string {
+ }
+ export function createWebsiteProjectPreviewDispatch(dependencies: Readonly<{
+   workflowSha: string;
++  /** refs/heads/main (legacy) or refs/tags/lws-preview-runner-YYYYMMDD-NN. */
++  workflowRefName: string;
+   client: PreviewDispatchRpc;
+   acquireToken(leaseId: string): PromiseLike<{ token: string; expiresAt: string }>;
++  /** Returns the commit SHA the dispatch ref currently points to (pre-dispatch drift guard). */
++  readRefCommit(refName: string, token: string): PromiseLike<string>;
+   fetch(request: Request): Promise<Response>;
+ }>) {
+   if (!SHA.test(dependencies.workflowSha)) throw new Error("PROJECT_PREVIEW_WORKFLOW_NOT_CONFIGURED");
++  let dispatchRef: string;
++  try {
++    dispatchRef = previewWorkflowRefShortName(dependencies.workflowRefName);
++  } catch {
++    throw new Error("PROJECT_PREVIEW_WORKFLOW_NOT_CONFIGURED");
++  }
+   return {
+     async dispatch(leaseId: string, buildId: string, expectedCommitSha: string) {
+       if (!UUID.test(leaseId) || !UUID.test(buildId) || !SHA.test(expectedCommitSha)) {
+@@ -82,6 +114,34 @@ export function createWebsiteProjectPreviewDispatch(dependencies: Readonly<{
+         });
+         throw new Error("PROJECT_PREVIEW_DISPATCH_TOKEN_UNAVAILABLE");
+       }
++      // Pin-drift guard: never start a run that the OIDC revision check must refuse.
++      // A drifted or unverifiable ref ends this attempt cleanly (REJECTED -> FAILED,
++      // leases released) instead of leaving an ACCEPTED lease behind a generic 503.
++      let pinFailure: string | null = null;
++      try {
++        const actual = await dependencies.readRefCommit(dependencies.workflowRefName, token.token);
++        if (actual !== dependencies.workflowSha) pinFailure = "PROJECT_PREVIEW_WORKFLOW_PIN_DRIFT";
++      } catch {
++        pinFailure = "PROJECT_PREVIEW_WORKFLOW_PIN_UNVERIFIABLE";
++      }
++      if (pinFailure) {
++        // Only a confirmed terminal FAILED state proves the lease was released. If the
++        // REJECTED write itself fails, times out or returns anything else, nothing was
++        // dispatched but the lease may still be open: surface that explicitly (never
++        // retry blindly); recovery is the read-only check + approved terminalisation
++        // in docs/website-project-preview-release-tag.md.
++        let released = false;
++        try {
++          const recorded = await previewRpc(dependencies.client, "record_website_project_preview_dispatch_v1", {
++            p_lease_id: leaseId, p_outcome: "REJECTED",
++          });
++          released = recorded.state === "FAILED";
++        } catch {
++          released = false;
++        }
++        if (!released) throw new Error("PROJECT_PREVIEW_DISPATCH_REJECT_UNRECORDED");
++        throw new Error(pinFailure);
++      }
+       try {
+         const response = await dependencies.fetch(new Request(
+           `https://api.github.com/repos/${PREVIEW_WORKFLOW_REPOSITORY}/actions/workflows/build-website-project-preview.yml/dispatches`,
+@@ -89,7 +149,7 @@ export function createWebsiteProjectPreviewDispatch(dependencies: Readonly<{
+             method: "POST", redirect: "error", signal: AbortSignal.timeout(10000),
+             headers: { authorization: `Bearer ${token.token}`, accept: "application/vnd.github+json",
+               "content-type": "application/json", "x-github-api-version": "2022-11-28" },
+-            body: JSON.stringify({ ref: "main", inputs: {
++            body: JSON.stringify({ ref: dispatchRef, inputs: {
+               repository_owner: authority.repositoryOwner, repository_name: authority.repositoryName,
+               repository_id: authority.repositoryId, commit_sha: expectedCommitSha,
+               lease_id: leaseId, build_id: buildId,
+diff --git a/supabase/functions/_shared/website-project-preview-oidc-broker.test.ts b/supabase/functions/_shared/website-project-preview-oidc-broker.test.ts
+index 1dff633..33797a8 100644
+--- a/supabase/functions/_shared/website-project-preview-oidc-broker.test.ts
++++ b/supabase/functions/_shared/website-project-preview-oidc-broker.test.ts
+@@ -120,4 +120,76 @@ Deno.test("rejects wrong platform repository, ref, workflow, expiry, and tamperi
+     WebsiteProjectPreviewOidcError,
+     "OIDC_SIGNATURE_INVALID",
+   );
+-});
+\ No newline at end of file
++});
++const monitorExpected = {
++  ...expected,
++  workflowRef: "lorenzo-web-solutions/platform/.github/workflows/complete-website-project-preview.yml@refs/heads/main",
++  workflowEvent: "workflow_run" as const,
++  workflowSha: "e".repeat(40),
++  jobWorkflowRef:
++    "lorenzo-web-solutions/platform/.github/workflows/complete-website-project-preview-runner.yml@refs/tags/lws-preview-runner-20261121-01",
++  jobWorkflowSha: "e".repeat(40),
++};
++const monitorClaims = {
++  event_name: "workflow_run",
++  workflow_ref: monitorExpected.workflowRef,
++  // caller follows main: deliberately NOT equal to the pin
++  workflow_sha: "f".repeat(40),
++  sha: "f".repeat(40),
++  job_workflow_ref: monitorExpected.jobWorkflowRef,
++  job_workflow_sha: "e".repeat(40),
++};
++
++Deno.test("pinned runner mode accepts a moved caller but only the reviewed runner revision", async () => {
++  const oidc = await fixture(monitorClaims);
++  const verified = await verifyGitHubActionsOidcToken(oidc.token, monitorExpected, { fetch: oidc.fetch });
++  assertEquals(verified.jobWorkflowSha, "e".repeat(40));
++  for (const override of [
++    { job_workflow_sha: "f".repeat(40) },
++    { job_workflow_ref: monitorExpected.jobWorkflowRef.replace("-01", "-02") },
++    { job_workflow_ref: monitorExpected.jobWorkflowRef.replace("@refs/tags/lws-preview-runner-20261121-01", "@refs/heads/main") },
++    { job_workflow_ref: undefined },
++    { job_workflow_sha: undefined },
++  ]) {
++    const tampered = await fixture({ ...monitorClaims, ...override });
++    await assertRejects(() => verifyGitHubActionsOidcToken(tampered.token, monitorExpected, { fetch: tampered.fetch }),
++      WebsiteProjectPreviewOidcError, "OIDC_JOB_WORKFLOW_MISMATCH");
++  }
++});
++
++Deno.test("pinned runner mode keeps every caller identity check", async () => {
++  for (const [override, code] of [
++    [{ event_name: "workflow_dispatch" }, "OIDC_EVENT_MISMATCH"],
++    [{ run_attempt: "2" }, "OIDC_RUN_ATTEMPT_INVALID"],
++    [{ ref: "refs/heads/other" }, "OIDC_REF_MISMATCH"],
++    [{ workflow_ref: expected.workflowRef }, "OIDC_WORKFLOW_MISMATCH"],
++    [{ repository_id: "1" }, "OIDC_REPOSITORY_MISMATCH"],
++    [{ run_id: "1" }, "OIDC_RUN_MISMATCH"],
++  ] as const) {
++    const oidc = await fixture({ ...monitorClaims, ...override });
++    await assertRejects(() => verifyGitHubActionsOidcToken(oidc.token, monitorExpected, { fetch: oidc.fetch }),
++      WebsiteProjectPreviewOidcError, code);
++  }
++});
++
++Deno.test("build mode still requires caller workflow_sha and sha even when job claims match", async () => {
++  const oidc = await fixture({ workflow_sha: "d".repeat(40), job_workflow_sha: "c".repeat(40),
++    job_workflow_ref: expected.workflowRef });
++  await assertRejects(() => verifyGitHubActionsOidcToken(oidc.token, expected, { fetch: oidc.fetch }),
++    WebsiteProjectPreviewOidcError, "OIDC_WORKFLOW_REVISION_MISMATCH");
++});
++
++Deno.test("incomplete or foreign pinned-runner authority is refused before any key fetch", async () => {
++  let fetched = 0;
++  const countingFetch = async () => { fetched++; return Response.json({ keys: [] }); };
++  for (const authority of [
++    { ...monitorExpected, jobWorkflowSha: undefined },
++    { ...monitorExpected, jobWorkflowRef: undefined },
++    { ...monitorExpected, jobWorkflowSha: "not-a-sha" },
++    { ...monitorExpected, jobWorkflowRef: "fork/platform/.github/workflows/x.yml@refs/tags/lws-preview-runner-20261121-01" },
++  ]) {
++    await assertRejects(() => verifyGitHubActionsOidcToken("a.b.c", authority, { fetch: countingFetch }),
++      WebsiteProjectPreviewOidcError, "OIDC_AUTHORITY_INVALID");
++  }
++  assertEquals(fetched, 0);
++});
+diff --git a/supabase/functions/_shared/website-project-preview-oidc-broker.ts b/supabase/functions/_shared/website-project-preview-oidc-broker.ts
+index fd34aa5..d8ae555 100644
+--- a/supabase/functions/_shared/website-project-preview-oidc-broker.ts
++++ b/supabase/functions/_shared/website-project-preview-oidc-broker.ts
+@@ -52,6 +52,13 @@ export type WebsiteProjectPreviewOidcAuthority = Readonly<{
+   workflowRefName: string;
+   workflowSha: string;
+   workflowEvent?: "workflow_dispatch" | "workflow_run";
++  /**
++   * Pinned reusable-workflow mode (completion monitor). When set, the revision pin
++   * is enforced on GitHub's job_workflow_ref/job_workflow_sha claims of the called
++   * workflow instead of on the caller's workflow_sha/sha, which follow main.
++   */
++  jobWorkflowRef?: string;
++  jobWorkflowSha?: string;
+   customerRepository: string;
+   customerRepositoryId: string;
+   customerCommitSha: string;
+@@ -76,6 +83,11 @@ export async function verifyGitHubActionsOidcToken(
+     || !expected.workflowRepository || !expected.workflowRef || !expected.workflowRefName) {
+     fail("OIDC_AUTHORITY_INVALID");
+   }
++  const pinnedJobWorkflow = expected.jobWorkflowRef !== undefined || expected.jobWorkflowSha !== undefined;
++  if (pinnedJobWorkflow && (!expected.jobWorkflowRef || !SHA.test(String(expected.jobWorkflowSha ?? ""))
++    || !expected.jobWorkflowRef.startsWith(`${expected.workflowRepository}/.github/workflows/`))) {
++    fail("OIDC_AUTHORITY_INVALID");
++  }
+   const parts = String(token || "").split(".");
+   if (parts.length !== 3) fail("OIDC_TOKEN_MALFORMED");
+   const [encodedHeader, encodedPayload, encodedSignature] = parts;
+@@ -133,7 +145,11 @@ export async function verifyGitHubActionsOidcToken(
+   if (claims.repository_id !== expected.workflowRepositoryId) fail("OIDC_REPOSITORY_MISMATCH");
+   if (claims.ref !== expected.workflowRefName) fail("OIDC_REF_MISMATCH");
+   if (claims.workflow_ref !== expected.workflowRef) fail("OIDC_WORKFLOW_MISMATCH");
+-  if (claims.workflow_sha !== expected.workflowSha || claims.sha !== expected.workflowSha) {
++  if (pinnedJobWorkflow) {
++    if (claims.job_workflow_ref !== expected.jobWorkflowRef || claims.job_workflow_sha !== expected.jobWorkflowSha) {
++      fail("OIDC_JOB_WORKFLOW_MISMATCH");
++    }
++  } else if (claims.workflow_sha !== expected.workflowSha || claims.sha !== expected.workflowSha) {
+     fail("OIDC_WORKFLOW_REVISION_MISMATCH");
+   }
+   if (claims.run_attempt !== "1") fail("OIDC_RUN_ATTEMPT_INVALID");
+diff --git a/supabase/functions/_shared/website-project-preview-pin-drift.test.ts b/supabase/functions/_shared/website-project-preview-pin-drift.test.ts
+new file mode 100644
+index 0000000..9793116
+--- /dev/null
++++ b/supabase/functions/_shared/website-project-preview-pin-drift.test.ts
+@@ -0,0 +1,55 @@
++import assert from "node:assert/strict";
++import { createPreviewRefCommitReader } from "./website-project-preview-dispatch-runtime.ts";
++import { assertRunnerRevision } from "../../../scripts/website-project-preview-complete.ts";
++
++const sha = "a".repeat(40);
++const tag = "refs/tags/lws-preview-runner-20261121-01";
++
++function reader(status: number, body: unknown, seen: Request[] = []) {
++  return createPreviewRefCommitReader(async (request) => {
++    seen.push(request);
++    return status === 200 ? Response.json(body) : new Response("private provider detail", { status });
++  });
++}
++
++Deno.test("ref reader asks GitHub for exactly the configured ref of the platform repository", async () => {
++  const seen: Request[] = [];
++  assert.equal(await reader(200, { ref: tag, object: { type: "commit", sha } }, seen)(tag, "test-token"), sha);
++  assert.equal(seen.length, 1);
++  assert.equal(seen[0].method, "GET");
++  assert.equal(seen[0].redirect, "error");
++  assert.equal(seen[0].url,
++    "https://api.github.com/repos/lorenzobombello-max/lorenzo-web-studio/git/ref/tags/lws-preview-runner-20261121-01");
++  assert.equal(seen[0].headers.get("authorization"), "Bearer test-token");
++  const main: Request[] = [];
++  await reader(200, { ref: "refs/heads/main", object: { type: "commit", sha } }, main)("refs/heads/main", "t");
++  assert.equal(main[0].url, "https://api.github.com/repos/lorenzobombello-max/lorenzo-web-studio/git/ref/heads/main");
++});
++
++Deno.test("ref reader fails closed on annotated tags, other refs, bad bodies and non-200", async () => {
++  for (const [status, body] of [
++    [200, { ref: tag, object: { type: "tag", sha } }],
++    [200, { ref: "refs/tags/lws-preview-runner-20261121-02", object: { type: "commit", sha } }],
++    [200, { ref: tag, object: { type: "commit", sha: "A".repeat(40) } }],
++    [200, { ref: tag }],
++    [200, [{ ref: tag, object: { type: "commit", sha } }]],
++    [404, null], [403, null], [301, null], [500, null],
++  ] as const) {
++    await assert.rejects(() => reader(status, body)(tag, "t"), /^Error: PROJECT_PREVIEW_WORKFLOW_PIN_UNVERIFIABLE$/,
++      `${status} ${JSON.stringify(body)}`);
++  }
++});
++
++function token(claims: Record<string, unknown>): string {
++  const encode = (value: unknown) => btoa(JSON.stringify(value)).replaceAll("+", "-").replaceAll("/", "_").replaceAll("=", "");
++  return `${encode({ alg: "RS256" })}.${encode(claims)}.signature`;
++}
++
++Deno.test("runner refuses to post when its checkout differs from the GitHub-attested runner revision", () => {
++  assertRunnerRevision(token({ job_workflow_sha: sha }), sha);
++  assert.throws(() => assertRunnerRevision(token({ job_workflow_sha: "b".repeat(40) }), sha),
++    /COMPLETION_RUNNER_REVISION_MISMATCH/);
++  assert.throws(() => assertRunnerRevision(token({}), sha), /COMPLETION_RUNNER_REVISION_MISMATCH/);
++  assert.throws(() => assertRunnerRevision(token({ job_workflow_sha: sha }), "HEAD"), /COMPLETION_RUNNER_REVISION_MISMATCH/);
++  assert.throws(() => assertRunnerRevision("not-a-token", sha), /COMPLETION_/);
++});
+diff --git a/supabase/functions/commercial-operator-command/preview-frontend-contract.test.ts b/supabase/functions/commercial-operator-command/preview-frontend-contract.test.ts
+index a37b7b0..882c695 100644
+--- a/supabase/functions/commercial-operator-command/preview-frontend-contract.test.ts
++++ b/supabase/functions/commercial-operator-command/preview-frontend-contract.test.ts
+@@ -31,6 +31,8 @@ for (const httpStatus of [204, 503]) {
+     const expectedStatus = httpStatus === 204 ? "BUILD_QUEUED" : "DISPATCH_UNKNOWN";
+     const dispatcher = createWebsiteProjectPreviewDispatch({
+       workflowSha,
++      workflowRefName: "refs/tags/lws-preview-runner-20261121-01",
++      readRefCommit: async () => workflowSha,
+       acquireToken: async () => ({ token: "synthetic-token", expiresAt: new Date(Date.now() + 60000).toISOString() }),
+       client: { rpc: async (name, args) => ({
+         error: null,
+diff --git a/supabase/functions/website-project-preview-completion/handler.test.ts b/supabase/functions/website-project-preview-completion/handler.test.ts
+index 38d6f3f..f338e5a 100644
+--- a/supabase/functions/website-project-preview-completion/handler.test.ts
++++ b/supabase/functions/website-project-preview-completion/handler.test.ts
+@@ -18,3 +18,21 @@ Deno.test("completion accepts only bounded identity fields and never echoes prov
+   const oversized = await handlePreviewCompletion(request({ ...input, leaseId: "x".repeat(4097) }), service);
+   assert.equal(oversized.status, 400);
+ });
++
++Deno.test("completion surfaces only the broker's constant OIDC codes", async () => {
++  const { WebsiteProjectPreviewOidcError } = await import("../_shared/website-project-preview-oidc-broker.ts");
++  const body = { leaseId: "lease", buildId: "build", workflowRunId: "123", monitorRunId: "456" };
++  const request = () => new Request("http://local", {
++    method: "POST", headers: { authorization: "Bearer test", "content-type": "application/json" },
++    body: JSON.stringify(body),
++  });
++  const refused = await handlePreviewCompletion(request(),
++    { complete: async () => { throw new WebsiteProjectPreviewOidcError("OIDC_JOB_WORKFLOW_MISMATCH"); } });
++  assert.equal(refused.status, 403);
++  assert.deepEqual(await refused.json(), { ok: false, code: "OIDC_JOB_WORKFLOW_MISMATCH" });
++  // a plain Error carrying an OIDC-looking message is still masked
++  const masked = await handlePreviewCompletion(request(),
++    { complete: async () => { throw new Error("OIDC_JOB_WORKFLOW_MISMATCH"); } });
++  assert.equal(masked.status, 503);
++  assert.deepEqual(await masked.json(), { ok: false, code: "COMPLETION_NOT_CONFIRMED" });
++});
+diff --git a/supabase/functions/website-project-preview-completion/handler.ts b/supabase/functions/website-project-preview-completion/handler.ts
+index 3aca145..e410138 100644
+--- a/supabase/functions/website-project-preview-completion/handler.ts
++++ b/supabase/functions/website-project-preview-completion/handler.ts
+@@ -1,4 +1,5 @@
+ import type { CompletionInput } from "./service.ts";
++import { WebsiteProjectPreviewOidcError } from "../_shared/website-project-preview-oidc-broker.ts";
+ 
+ export async function handlePreviewCompletion(request: Request, service: {
+   complete(input: CompletionInput): Promise<Record<string, unknown>>;
+@@ -38,7 +39,12 @@ export async function handlePreviewCompletion(request: Request, service: {
+       monitorRunId: String(body.monitorRunId), oidcToken: token,
+     });
+     return Response.json({ ok: true, state: result.state }, { headers });
+-  } catch {
++  } catch (error) {
++    // Only the broker's own constant OIDC codes are surfaced (no provider detail),
++    // so a revision/pin refusal is diagnosable instead of a generic 503.
++    if (error instanceof WebsiteProjectPreviewOidcError) {
++      return Response.json({ ok: false, code: error.code }, { status: 403, headers });
++    }
+     return Response.json({ ok: false, code: "COMPLETION_NOT_CONFIRMED" }, { status: 503, headers });
+   }
+ }
+diff --git a/supabase/functions/website-project-preview-completion/index.ts b/supabase/functions/website-project-preview-completion/index.ts
+index dc90100..8bb0f1e 100644
+--- a/supabase/functions/website-project-preview-completion/index.ts
++++ b/supabase/functions/website-project-preview-completion/index.ts
+@@ -1,7 +1,14 @@
+ import { createClient } from "npm:@supabase/supabase-js@2";
+ import { getSupabaseServerSecretKey } from "../_shared/supabase-key-bindings.ts";
+ import { createPreviewPlatformTokenProvider } from "../_shared/website-project-preview-dispatch-runtime.ts";
+-import { PREVIEW_MONITOR_PATH, PREVIEW_WORKFLOW_REPOSITORY, PREVIEW_WORKFLOW_REPOSITORY_ID, previewRpc } from "../_shared/website-project-preview-dispatch.ts";
++import {
++  assertPreviewWorkflowRefName,
++  PREVIEW_MONITOR_PATH,
++  PREVIEW_MONITOR_RUNNER_PATH,
++  PREVIEW_WORKFLOW_REPOSITORY,
++  PREVIEW_WORKFLOW_REPOSITORY_ID,
++  previewRpc,
++} from "../_shared/website-project-preview-dispatch.ts";
+ import { verifyGitHubActionsOidcToken } from "../_shared/website-project-preview-oidc-broker.ts";
+ import { createPreviewCompletionService } from "./service.ts";
+ import { handlePreviewCompletion } from "./handler.ts";
+@@ -12,8 +19,10 @@ import { runPreviewDeadlineSweep } from "./deadline.ts";
+ export function createPreviewCompletionRuntime() {
+   const audience = Deno.env.get("LWS_PREVIEW_COMPLETION_OIDC_AUDIENCE") ?? "";
+   const monitorSha = Deno.env.get("LWS_PREVIEW_COMPLETION_WORKFLOW_SHA") ?? "";
++  const refName = Deno.env.get("LWS_PREVIEW_WORKFLOW_REF_NAME") ?? "";
+   const url = Deno.env.get("SUPABASE_URL") ?? "";
+   if (!audience || !url || !/^[0-9a-f]{40}$/.test(monitorSha)) throw new Error("SERVER_CONFIGURATION_ERROR");
++  try { assertPreviewWorkflowRefName(refName); } catch { throw new Error("SERVER_CONFIGURATION_ERROR"); }
+   const client = createClient(url, getSupabaseServerSecretKey("default"), {
+     auth: { persistSession: false, autoRefreshToken: false },
+   });
+@@ -31,13 +40,18 @@ export function createPreviewCompletionRuntime() {
+     return await response.json();
+   };
+   return createPreviewCompletionService({
++    workflowRefName: refName,
+     resolve: (input) => previewRpc(client, "get_website_project_preview_dispatch_completion_v1", {
+       p_lease_id: input.leaseId, p_build_id: input.buildId,
+     }),
+     verifyMonitor: (input, authority) => verifyGitHubActionsOidcToken(input.oidcToken, {
+       audience, workflowRepository: PREVIEW_WORKFLOW_REPOSITORY, workflowRepositoryId: PREVIEW_WORKFLOW_REPOSITORY_ID,
+       workflowRef: `${PREVIEW_WORKFLOW_REPOSITORY}/${PREVIEW_MONITOR_PATH}@refs/heads/main`,
++      // The thin workflow_run caller always runs from main; the pin is enforced on
++      // the reusable runner it calls at the reviewed ref (job_workflow_* claims).
+       workflowRefName: "refs/heads/main", workflowSha: monitorSha, workflowEvent: "workflow_run",
++      jobWorkflowRef: `${PREVIEW_WORKFLOW_REPOSITORY}/${PREVIEW_MONITOR_RUNNER_PATH}@${refName}`,
++      jobWorkflowSha: monitorSha,
+       runId: input.monitorRunId, leaseId: input.leaseId, buildId: input.buildId,
+       customerRepository: String(authority.repository), customerRepositoryId: String(authority.repositoryId),
+       customerCommitSha: String(authority.commitSha),
+diff --git a/supabase/functions/website-project-preview-completion/service.test.ts b/supabase/functions/website-project-preview-completion/service.test.ts
+index e0caa96..76fcca8 100644
+--- a/supabase/functions/website-project-preview-completion/service.test.ts
++++ b/supabase/functions/website-project-preview-completion/service.test.ts
+@@ -5,9 +5,11 @@ const leaseId = "11111111-1111-4111-8111-111111111111";
+ const buildId = "22222222-2222-4222-8222-222222222222";
+ const workflowSha = "a".repeat(40);
+ const input = { leaseId, buildId, workflowRunId: "123", monitorRunId: "456", oidcToken: "test" };
+-function harness(overrides: Record<string, unknown> = {}, terminal = "FAILED", failedJob = "build") {
++function harness(overrides: Record<string, unknown> = {}, terminal = "FAILED", failedJob = "build",
++  workflowRefName = "refs/heads/main") {
+   const calls: string[] = [];
+   const service = createPreviewCompletionService({
++    workflowRefName,
+     resolve: async () => ({ leaseId, buildId, workflowSha, runId: "123" }),
+     verifyMonitor: async () => { calls.push("oidc"); },
+     getRun: async () => ({ id: 123, run_attempt: 1, event: "workflow_dispatch", status: "completed",
+@@ -54,3 +56,20 @@ Deno.test("a committed success wins over late failure callbacks without storage
+   assert.equal((await service.complete(input)).state, "PASS");
+   assert.deepEqual(calls, ["oidc", "BUILD_FAILED"]);
+ });
++
++const tag = "refs/tags/lws-preview-runner-20261121-01";
++Deno.test("a tag-dispatched run completes only when head_branch is the reviewed tag", async () => {
++  const { service, calls } = harness({ head_branch: "lws-preview-runner-20261121-01" }, "FAILED", "build", tag);
++  assert.equal((await service.complete(input)).state, "FAILED");
++  assert.deepEqual(calls, ["oidc", "BUILD_FAILED", "cleanup"]);
++  for (const head_branch of ["main", "lws-preview-runner-20261121-02", "refs/tags/lws-preview-runner-20261121-01"]) {
++    const other = harness({ head_branch }, "FAILED", "build", tag);
++    await assert.rejects(() => other.service.complete(input), /COMPLETION_RUN_INVALID/);
++    assert.deepEqual(other.calls, ["oidc"]);
++  }
++});
++Deno.test("completion refuses an unreviewed ref configuration at construction", () => {
++  for (const refName of ["", "refs/heads/dev", "refs/tags/v1"]) {
++    assert.throws(() => harness({}, "FAILED", "build", refName), /CONFIGURATION_INVALID/);
++  }
++});
+diff --git a/supabase/functions/website-project-preview-completion/service.ts b/supabase/functions/website-project-preview-completion/service.ts
+index e7d7a55..1e06b40 100644
+--- a/supabase/functions/website-project-preview-completion/service.ts
++++ b/supabase/functions/website-project-preview-completion/service.ts
+@@ -1,4 +1,10 @@
+-import { PREVIEW_WORKFLOW_PATH, PREVIEW_WORKFLOW_REPOSITORY, PREVIEW_WORKFLOW_REPOSITORY_ID, previewRecord } from "../_shared/website-project-preview-dispatch.ts";
++import {
++  PREVIEW_WORKFLOW_PATH,
++  PREVIEW_WORKFLOW_REPOSITORY,
++  PREVIEW_WORKFLOW_REPOSITORY_ID,
++  previewRecord,
++  previewWorkflowRefShortName,
++} from "../_shared/website-project-preview-dispatch.ts";
+ 
+ export type CompletionInput = Readonly<{
+   leaseId: string; buildId: string; workflowRunId: string; monitorRunId: string; oidcToken: string;
+@@ -8,6 +14,8 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-
+ const runIdValid = (id: string) => /^[1-9][0-9]*$/.test(id) && Number.isSafeInteger(Number(id));
+ 
+ export function createPreviewCompletionService(dependencies: {
++  /** Ref the build workflow is dispatched on; run.head_branch must equal its short name. */
++  workflowRefName: string;
+   resolve(input: CompletionInput): Promise<Record<string, unknown>>;
+   verifyMonitor(input: CompletionInput, authority: CompletionAuthority): Promise<unknown>;
+   getRun(runId: string, leaseId: string): Promise<unknown>;
+@@ -15,6 +23,7 @@ export function createPreviewCompletionService(dependencies: {
+   finish(input: CompletionInput & { workflowSha: string }, reason: string): Promise<Record<string, unknown>>;
+   cleanup(buildId: string): Promise<void>;
+ }) {
++  const expectedHeadBranch = previewWorkflowRefShortName(dependencies.workflowRefName);
+   return {
+     async complete(input: CompletionInput): Promise<Record<string, unknown>> {
+       if (!UUID.test(input.leaseId) || !UUID.test(input.buildId)
+@@ -37,7 +46,7 @@ export function createPreviewCompletionService(dependencies: {
+         }
+       }
+       if (String(run.id) !== input.workflowRunId || run.run_attempt !== 1 || run.event !== "workflow_dispatch"
+-        || run.status !== "completed" || run.head_sha !== workflowSha || run.head_branch !== "main"
++        || run.status !== "completed" || run.head_sha !== workflowSha || run.head_branch !== expectedHeadBranch
+         || run.path !== PREVIEW_WORKFLOW_PATH
+         || run.display_title !== `LWS preview lease=${input.leaseId} build=${input.buildId}`) {
+         throw new Error("PROJECT_PREVIEW_COMPLETION_RUN_INVALID");
+diff --git a/supabase/functions/website-project-preview-source-token/handler.test.ts b/supabase/functions/website-project-preview-source-token/handler.test.ts
+index cec7d4d..d3d83e1 100644
+--- a/supabase/functions/website-project-preview-source-token/handler.test.ts
++++ b/supabase/functions/website-project-preview-source-token/handler.test.ts
+@@ -179,3 +179,15 @@ Deno.test("source-token service never exchanges after authority or OIDC failure"
+   }
+   assertEquals(exchanges, 0);
+ });
++
++Deno.test("source-token endpoint names OIDC revision, attempt, event and runner refusals instead of a generic 503", async () => {
++  for (const code of ["OIDC_WORKFLOW_REVISION_MISMATCH", "OIDC_RUN_ATTEMPT_INVALID", "OIDC_EVENT_MISMATCH",
++    "OIDC_JOB_WORKFLOW_MISMATCH"]) {
++    const response = await handleWebsiteProjectPreviewSourceToken(
++      request({ leaseId: "lease", buildId: "build", workflowRunId: "42" }),
++      { issue: async () => { throw new Error(code); } },
++    );
++    assertEquals(response.status, 403);
++    assertEquals(await response.json(), { ok: false, code });
++  }
++});
+diff --git a/supabase/functions/website-project-preview-source-token/handler.ts b/supabase/functions/website-project-preview-source-token/handler.ts
+index a72654e..5fec49e 100644
+--- a/supabase/functions/website-project-preview-source-token/handler.ts
++++ b/supabase/functions/website-project-preview-source-token/handler.ts
+@@ -21,11 +21,14 @@ const SAFE_CODES = new Set([
+   "GITHUB_TOKEN_TIMEOUT",
+   "OIDC_AUDIENCE_INVALID",
+   "OIDC_AUTHORITY_INVALID",
++  "OIDC_EVENT_MISMATCH",
+   "OIDC_HEADER_INVALID",
+   "OIDC_ISSUER_INVALID",
++  "OIDC_JOB_WORKFLOW_MISMATCH",
+   "OIDC_JWKS_UNAVAILABLE",
+   "OIDC_REF_MISMATCH",
+   "OIDC_REPOSITORY_MISMATCH",
++  "OIDC_RUN_ATTEMPT_INVALID",
+   "OIDC_RUN_MISMATCH",
+   "OIDC_SIGNATURE_INVALID",
+   "OIDC_SIGNING_KEY_INVALID",
+@@ -35,6 +38,7 @@ const SAFE_CODES = new Set([
+   "OIDC_TOKEN_MALFORMED",
+   "OIDC_TOKEN_TIME_INVALID",
+   "OIDC_WORKFLOW_MISMATCH",
++  "OIDC_WORKFLOW_REVISION_MISMATCH",
+   "PROJECT_PREVIEW_ARTIFACT_AUTHORITY_INVALID",
+   "PROJECT_PREVIEW_BUILD_AUTHORITY_INVALID",
+   "PROJECT_PREVIEW_LEASE_INVALID",

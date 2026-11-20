@@ -1,0 +1,95 @@
+name: LWS GIT-001C Independent Test Matrix
+# Onafhankelijke herhaling van de testmatrix op een GitHub-hosted runner. Geen secrets, geen Supabase.
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  matrix:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: proof
+          persist-credentials: false
+      - name: Verify patch hash (R2)
+        shell: bash
+        run: echo "f4e2531ccc25f01b3de57bbb4b4574f2b403b7e92359d3c3ad2e72709d9507b1  proof/patch/git001c-pin-drift-releasetag.patch" | sha256sum -c -
+      - uses: actions/checkout@v4
+        with:
+          repository: lorenzobombello-max/lorenzo-web-studio
+          ref: c35e5c8014209a2f2a5d03e4676610e34a7f9820
+          path: baseline
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: lorenzobombello-max/lorenzo-web-studio
+          ref: c35e5c8014209a2f2a5d03e4676610e34a7f9820
+          path: candidate
+          persist-credentials: false
+      - name: Apply candidate patch
+        shell: bash
+        run: |
+          cd candidate
+          git apply --check ../proof/patch/git001c-pin-drift-releasetag.patch
+          git apply ../proof/patch/git001c-pin-drift-releasetag.patch
+          git status --short
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: "2.9.5"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Deno preview suite (baseline and candidate)
+        shell: bash
+        run: |
+          for d in baseline candidate; do
+            ( cd "$d"
+              files=$(ls supabase/functions/website-project-preview-*/*.test.ts supabase/functions/_shared/website-project-preview-*.test.ts supabase/functions/commercial-operator-command/preview-frontend-contract.test.ts | grep -v integration | sort -u)
+              echo "$files" | wc -l > "../files-$d.txt"
+              set +e
+              deno test --allow-all --no-check --node-modules-dir=auto $files > "../deno-$d.txt" 2>&1
+              echo $? > "../exit-$d.txt" )
+            sed -i 's/\x1b\[[0-9;]*m//g' "deno-$d.txt"
+            line=$(grep -E "^(ok|FAILED) \| [0-9]+ passed \| [0-9]+ failed" "deno-$d.txt" | tail -1)
+            if [ -z "$line" ]; then echo "FAIL: geen testsamenvatting voor $d"; tail -40 "deno-$d.txt"; exit 1; fi
+            echo "$line" | sed -E 's/^[A-Z a-z]+\| ([0-9]+) passed \| ([0-9]+) failed.*/\1 \2/' > "count-$d.txt"
+            { grep -E "\.\.\. FAILED|Uncaught error" "deno-$d.txt" || true; } | sed 's/ (.*//' | sort -u > "fail-$d.txt"
+            echo "== $d  bestanden=$(cat files-$d.txt)  exit=$(cat exit-$d.txt)  geslaagd/gefaald=$(cat count-$d.txt)"
+            cat "fail-$d.txt"
+          done
+      - name: Node contract tests (candidate)
+        shell: bash
+        run: cd candidate && node --test scripts/website-project-preview-*.test.mjs scripts/git001c-*.test.mjs
+      - name: Deno typecheck (candidate, changed sources)
+        shell: bash
+        run: |
+          cd candidate
+          deno check --node-modules-dir=auto \
+            supabase/functions/_shared/website-project-preview-dispatch.ts \
+            supabase/functions/_shared/website-project-preview-dispatch-runtime.ts \
+            supabase/functions/_shared/website-project-preview-oidc-broker.ts \
+            supabase/functions/website-project-preview-completion/index.ts \
+            supabase/functions/website-project-preview-completion/service.ts \
+            supabase/functions/website-project-preview-completion/handler.ts \
+            supabase/functions/website-project-preview-source-token/index.ts \
+            supabase/functions/website-project-preview-source-token/handler.ts \
+            supabase/functions/website-project-preview-artifact/index.ts \
+            supabase/functions/commercial-operator-command/index.ts \
+            scripts/website-project-preview-complete.ts
+      - name: Verdict (exacte vergelijking met baseline)
+        shell: bash
+        run: |
+          read bp bf < count-baseline.txt
+          read cp cf < count-candidate.txt
+          fails=0
+          new=$(comm -13 fail-baseline.txt fail-candidate.txt)
+          if [ -n "$new" ]; then echo "FAIL: nieuwe foutnamen in kandidaat:"; echo "$new"; fails=1; fi
+          if [ "$cf" -ne "$bf" ]; then echo "FAIL: gefaald kandidaat=$cf baseline=$bf"; fails=1; fi
+          if [ $((cp - bp)) -ne 18 ]; then echo "FAIL: verwacht exact 18 extra geslaagde tests, gemeten $((cp - bp)) (kandidaat=$cp baseline=$bp)"; fails=1; fi
+          if [ "$(cat exit-candidate.txt)" != "$(cat exit-baseline.txt)" ]; then echo "FAIL: exitcode kandidaat=$(cat exit-candidate.txt) baseline=$(cat exit-baseline.txt)"; fails=1; fi
+          if [ "$fails" -ne 0 ]; then exit 1; fi
+          echo "PASS: baseline $bp/$bf, kandidaat $cp/$cf, +18 geslaagd, identieke foutset en exitcode"

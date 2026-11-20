@@ -1,0 +1,14 @@
+name: LWS OIDC Proof Monitor
+on:
+  workflow_run:
+    workflows: ["LWS OIDC Proof Build"]
+    types: [completed]
+permissions: {}
+jobs:
+  call:
+    permissions:
+      id-token: write
+      contents: read
+    uses: lorenzobombello-max/lws-oidc-proof/.github/workflows/proof-runner.yml@lws-preview-runner-20261120-99
+    with:
+      platform_ref: lws-preview-runner-20261120-99

@@ -1,0 +1,32 @@
+name: LWS OIDC Proof Runner
+on:
+  workflow_call:
+    inputs:
+      platform_ref:
+        required: true
+        type: string
+permissions: {}
+jobs:
+  claims:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ inputs.platform_ref }}
+          persist-credentials: false
+      - name: "4 OIDC claims runner + checkout"
+        shell: bash
+        env:
+          HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          RUN_EVENT: ${{ github.event.workflow_run.event }}
+        run: |
+          set -euo pipefail
+          tok=$(curl -fsS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=lws-oidc-proof" | jq -r .value)
+          p=$(cut -d. -f2 <<<"$tok" | tr '_-' '/+'); while [ $(( ${#p} % 4 )) -ne 0 ]; do p="$p="; done
+          echo "$p" | base64 -d | jq '{event_name, ref, ref_type, sha, workflow_ref, workflow_sha, job_workflow_ref, job_workflow_sha, run_id, run_attempt, repository}'
+          echo "checkout HEAD: $(git rev-parse HEAD)"
+          echo "workflow_run.head_branch: $HEAD_BRANCH   workflow_run.event: $RUN_EVENT"
