@@ -1,0 +1,26 @@
+name: LWS Proof Tag Bootstrap
+# Maakt eenmalig de lichtgewicht tag lws-preview-runner-20261120-99 op exact commit X.
+# Bestaat de tag al: alleen tonen, nooit verplaatsen.
+on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/proof-tag-bootstrap.yml]
+permissions: {}
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    permissions:
+      contents: write
+    steps:
+      - name: Create lightweight tag on X (never move)
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: lws-preview-runner-20261120-99
+          SHA: 4f717dfdc311bd3e1f3af1e771221295f212d2d0
+        run: |
+          if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" >/dev/null 2>&1; then
+            echo "tag bestaat al:"; gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" --jq '{ref, type: .object.type, sha: .object.sha}'; exit 0
+          fi
+          gh api -X POST "repos/$GITHUB_REPOSITORY/git/refs" -f ref="refs/tags/$TAG" -f sha="$SHA" --jq '{ref, type: .object.type, sha: .object.sha}'
